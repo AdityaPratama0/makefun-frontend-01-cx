@@ -1,5 +1,71 @@
 const API_ORIGIN = 'https://make.fun';
 const TIMEOUT_MS = 15000;
+const CACHE_TTL_MS = 120000;
+// A body past this many characters stays in memory only: localStorage holds strings at
+// roughly two bytes each and the competitions feed can run to a megabyte.
+const MAX_STORED_CHARS = 900000;
+const CACHE_PREFIX = 'makefun.cache.v1:';
+
+// Per-URL body + validator, in memory for this tab and in localStorage across loads.
+// A stored body inside the TTL answers without a request; past it, the ETag goes back
+// as If-None-Match and a 304 reuses the body instead of re-downloading it.
+const memory = new Map();
+
+function storage() {
+  try {
+    return typeof localStorage === 'undefined' ? null : localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function readStored(path) {
+  const hit = memory.get(path);
+  if (hit && typeof hit.at === 'number') return hit;
+  const store = storage();
+  if (!store) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(store.getItem(CACHE_PREFIX + path) || 'null');
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || !('body' in parsed)) return null;
+  return {
+    etag: typeof parsed.etag === 'string' && parsed.etag ? parsed.etag : null,
+    body: parsed.body,
+    at: typeof parsed.at === 'number' ? parsed.at : 0
+  };
+}
+
+function writeStored(path, record) {
+  memory.set(path, record);
+  const store = storage();
+  if (!store) return;
+  let serialised;
+  try {
+    serialised = JSON.stringify(record);
+  } catch {
+    return;
+  }
+  if (serialised.length > MAX_STORED_CHARS) return;
+  try {
+    store.setItem(CACHE_PREFIX + path, serialised);
+  } catch {
+    // Quota or a private-mode store that refuses writes: memory alone still works.
+  }
+}
+
+function dropped(path) {
+  memory.delete(path);
+  const store = storage();
+  if (!store) return;
+  try {
+    store.removeItem(CACHE_PREFIX + path);
+  } catch {
+    // nothing to clean
+  }
+}
 
 function numberFrom(value) {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
@@ -132,8 +198,9 @@ function rewardsFrom(raw) {
   return rows;
 }
 
-function normaliseCompetition(raw) {
+function normaliseCompetition(raw, options = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const prose = Boolean(options.prose);
 
   const categoryRaw = firstOf(raw, ['category', 'categoryName', 'category_name', 'track', 'type']);
   const category = typeof categoryRaw === 'object' && categoryRaw
@@ -142,7 +209,8 @@ function normaliseCompetition(raw) {
 
   const statusRaw = firstText(raw, ['status', 'state', 'phase']);
   const fee = numberField(raw, ['entryFeeUsd', 'entry_fee_usd', 'entryFee', 'entry_fee', 'feeUsd', 'fee_usd']);
-  const accepting = raw.acceptingSubmissions;
+  const acceptingRaw = raw.acceptingSubmissions ?? raw.accepting;
+  const accepting = typeof acceptingRaw === 'boolean' ? acceptingRaw : null;
 
   return {
     slug: firstText(raw, ['slug', 'id', 'key']),
@@ -155,11 +223,16 @@ function normaliseCompetition(raw) {
     entryFeeKnown: fee.known,
     endsAt: timestampFrom(firstOf(raw, ['deadline', 'endsAt', 'ends_at', 'closeAt', 'closesAt', 'closeDate', 'close_date', 'endDate', 'end_date'])),
     startsAt: timestampFrom(firstOf(raw, ['opensAt', 'opens_at', 'startsAt', 'starts_at', 'openAt', 'startDate', 'start_date'])),
+    publishedAt: timestampFrom(firstOf(raw, ['publishedAt', 'published_at', 'createdAt', 'created_at', 'postedAt'])),
     entries: firstNumber(raw, ['submissionCount', 'submission_count', 'entries', 'entriesCount', 'entries_count', 'entryCount', 'entry_count', 'participants', 'participantCount', 'participant_count', 'submissions']),
     status: statusRaw ? statusRaw.toLowerCase() : null,
-    accepting: typeof accepting === 'boolean' ? accepting : null,
+    accepting,
     url: firstText(raw, ['url', 'href', 'officialUrl', 'official_url', 'link', 'permalink']),
-    rewards: rewardsFrom(raw)
+    rewards: rewardsFrom(raw),
+    resultsOut: raw.resultsOut === true,
+    description: prose ? firstText(raw, ['description']) : null,
+    rules: prose ? firstText(raw, ['rules']) : null,
+    acceptingSubmissions: typeof raw.acceptingSubmissions === 'boolean' ? raw.acceptingSubmissions : null
   };
 }
 
@@ -221,37 +294,78 @@ function normaliseRow(raw, index, rankKey, micro, prizeByPlace) {
 
 async function request(path) {
   const url = `${API_ORIGIN}${path}`;
+  const stored = readStored(path);
+  if (stored && Date.now() - stored.at < CACHE_TTL_MS) return stored.body;
+
+  const headers = { accept: 'application/json' };
+  if (stored && stored.etag) headers['if-none-match'] = stored.etag;
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   let response;
   try {
-    response = await fetch(url, { headers: { accept: 'application/json' }, signal: controller.signal });
+    response = await fetch(url, {
+      headers,
+      cache: 'no-cache',
+      signal: controller.signal
+    });
   } catch (cause) {
     clearTimeout(timer);
+    // A browser revalidating across origins can see a 304 the CORS check refuses, which
+    // reaches here as a network error. The stored body is still the last answer make.fun
+    // gave, so it is better than an error screen while the ETag keeps trying.
+    if (stored) return stored.body;
     if (cause && cause.name === 'AbortError') throw new Error('make.fun did not answer in time');
     throw new Error('could not reach make.fun');
   }
   clearTimeout(timer);
 
+  if (response.status === 304) {
+    if (stored) {
+      writeStored(path, { etag: stored.etag, body: stored.body, at: Date.now() });
+      return stored.body;
+    }
+    dropped(path);
+    throw new Error('make.fun answered 304 with no stored copy');
+  }
+
   if (!response.ok) {
+    dropped(path);
     const error = new Error(`make.fun answered ${response.status}`);
     error.status = response.status;
     error.url = url;
     throw error;
   }
 
+  let body;
   try {
-    return await response.json();
+    body = await response.json();
   } catch {
     throw new Error('make.fun answered with something that is not JSON');
   }
+
+  const etag = response.headers.get('etag');
+  writeStored(path, { etag: etag || null, body, at: Date.now() });
+  return body;
 }
 
+// The board view asks for the API's open set, then checks every deadline itself: the feed
+// still calls a board open after its deadline, and the badge has to show CLOSED there.
 export async function loadCompetitions() {
-  const payload = await request('/api/competitions?status=open&limit=24');
+  const payload = await request('/api/competitions?status=open&limit=40');
   const list = findArray(payload) ?? [];
   return list
-    .map(normaliseCompetition)
+    .map((row) => normaliseCompetition(row))
+    .filter((item) => item && (item.slug || item.title));
+}
+
+// The bounties table is the whole feed, closed boards included, because that page's job is
+// to show status rather than to hide it.
+export async function loadAllCompetitions() {
+  const payload = await request('/api/competitions?limit=40');
+  const list = findArray(payload) ?? [];
+  return list
+    .map((row) => normaliseCompetition(row))
     .filter((item) => item && (item.slug || item.title));
 }
 
@@ -260,7 +374,83 @@ export async function loadCompetition(slug) {
   const payload = await request(`/api/competitions/${encodeURIComponent(slug)}`);
   const record = findCompetition(payload);
   if (!record) throw new Error('make.fun returned no board for this slug');
-  return normaliseCompetition(record);
+  return normaliseCompetition(record, { prose: true });
+}
+
+function normaliseProfileSolution(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const competition = raw.competition && typeof raw.competition === 'object' ? raw.competition : {};
+  const slug = firstText(competition, ['slug', 'id', 'key']);
+  const title = firstText(competition, ['title', 'name', 'headline']);
+  if (!slug && !title) return null;
+  const deadline = firstOf(competition, ['deadline', 'endsAt', 'ends_at', 'closeAt']);
+  return {
+    slug,
+    title,
+    status: (firstText(competition, ['status', 'state', 'phase']) || '').toLowerCase() || null,
+    endsAt: timestampFrom(deadline),
+    placement: firstNumber(raw, ['placement', 'rank', 'place']),
+    prizeUsd: firstNumber(raw, ['prize_usd', 'prizeUsd']),
+    at: timestampFrom(firstOf(raw, ['entered_at', 'enteredAt', 'createdAt', 'created_at']))
+  };
+}
+
+export async function loadProfile(handle) {
+  if (!handle) throw new Error('missing handle');
+  const payload = await request(`/api/profiles/${encodeURIComponent(handle)}`);
+  const raw = payload && typeof payload === 'object'
+    ? (payload.profile && typeof payload.profile === 'object' ? payload.profile : payload)
+    : null;
+  if (!raw) throw new Error('make.fun returned no profile for this handle');
+
+  const record = raw.record && typeof raw.record === 'object' ? raw.record : {};
+  const solutions = Array.isArray(raw.solutions) ? raw.solutions : [];
+  const entries = solutions.map(normaliseProfileSolution).filter(Boolean);
+
+  return {
+    handle: firstText(raw, ['handle', 'username', 'name']) || handle,
+    displayName: firstText(raw, ['display_name', 'displayName']),
+    joinedAt: timestampFrom(raw.joined_at ?? raw.joinedAt),
+    entriesCount: firstNumber(record, ['competitions_entered', 'competitionsEntered', 'entries']),
+    bestPlacement: firstNumber(record, ['best_placement', 'bestPlacement']),
+    wins: firstNumber(record, ['competitions_won', 'competitionsWon']),
+    prizeUsd: firstNumber(record, ['prize_usd', 'prizeUsd']),
+    entries
+  };
+}
+
+// The public feed states two things per competition: when it was published and when its
+// deadline falls. Those are the two events this page can honestly show.
+export async function loadActivity() {
+  const payload = await request('/api/competitions?limit=40');
+  const list = findArray(payload) ?? [];
+  const items = list.map(normaliseCompetition).filter(Boolean);
+  const now = Date.now();
+  const events = [];
+
+  for (const item of items) {
+    // publishedAt is a scheduled opening for boards that have not started yet, so an event is
+    // only activity once its date is behind us. A future date would claim something unopened.
+    const opened = item.publishedAt ? Date.parse(item.publishedAt) : NaN;
+    if (Number.isFinite(opened) && opened <= now) {
+      events.push({ kind: 'opened', at: item.publishedAt, item, slug: item.slug, title: item.title });
+    }
+    const end = item.endsAt ? Date.parse(item.endsAt) : NaN;
+    if (Number.isFinite(end) && end <= now) {
+      const resolved = item.resultsOut
+        || (typeof item.status === 'string' && /resolved|settled|ended|final|complete|closed/.test(item.status));
+      events.push({
+        kind: resolved ? 'result' : 'closed',
+        at: item.endsAt,
+        item,
+        slug: item.slug,
+        title: item.title
+      });
+    }
+  }
+
+  events.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  return events.slice(0, 40);
 }
 
 export async function loadLeaderboard(slug) {
@@ -283,7 +473,7 @@ export async function loadLeaderboard(slug) {
   }
 
   const detailRecord = findCompetition(detail);
-  const tournament = normaliseCompetition(detailRecord);
+  const tournament = normaliseCompetition(detailRecord, { prose: true });
   const prizeByPlace = prizeTable(tournament ? tournament.rewards : []);
 
   let intervalLevel = null;

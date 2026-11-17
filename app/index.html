@@ -3,23 +3,38 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="description" content="A fast, plain-HTML client for make.fun: the live bounty board, bounty pages, leaderboards, public profiles and recent activity, read from make.fun's public API.">
 <title>make.fun field guide</title>
 <link rel="stylesheet" href="./app.css">
 </head>
 <body>
+<a class="skip" href="#view">Skip to content</a>
 <header class="masthead">
   <a class="wordmark" href="#/">make.fun field guide</a>
   <nav class="nav" aria-label="Sections">
     <a href="#/">Boards</a>
     <a href="#/bounties">Bounties</a>
     <a href="#/leaderboard">Leaderboard</a>
+    <a href="#/activity">Activity</a>
+    <a href="#/profile/">Profile</a>
   </nav>
 </header>
-<main id="view" tabindex="-1"></main>
+<main id="view" tabindex="-1">
+  <div class="skeleton" role="status" aria-live="polite" aria-label="Loading make.fun">
+    <div class="sk-row" aria-hidden="true"><div class="sk-line sk-line--short"></div><div class="sk-line sk-line--mid"></div><div class="sk-line"></div></div>
+    <div class="sk-row" aria-hidden="true"><div class="sk-line sk-line--short"></div><div class="sk-line sk-line--mid"></div><div class="sk-line"></div></div>
+    <div class="sk-row" aria-hidden="true"><div class="sk-line sk-line--short"></div><div class="sk-line sk-line--mid"></div><div class="sk-line"></div></div>
+  </div>
+</main>
 <footer class="colophon">
   Data is live from make.fun's public API at <a href="https://make.fun" rel="noopener">make.fun</a>.
   Numbers shown are whatever the API returns. Nothing is filled in when a field is absent.
 </footer>
+<noscript>
+  <p>This guide is a small JavaScript client. Turn JavaScript on to read make.fun's public API, or open
+  <a href="https://make.fun">make.fun</a> itself.</p>
+</noscript>
 <script type="module" src="./app.js"></script>
 </body>
 </html>
